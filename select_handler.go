@@ -77,10 +77,12 @@ func handleSelect(sel *sqlparser.Select) (dsl string, esType string, err error) 
 		}
 	}
 
-	resultMap := make(map[string]interface{})
-	resultMap["query"] = queryMapStr
-	resultMap["from"] = queryFrom
-	resultMap["size"] = querySize
+	var resultMap = map[string]interface{}{
+		"query": queryMapStr,
+		"from":  queryFrom,
+		"size":  querySize,
+	}
+
 	if len(aggStr) > 0 {
 		resultMap["aggregations"] = aggStr
 	}
@@ -289,7 +291,7 @@ func handleSelectWhere(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Ex
 		return "", errors.New("elasticsql: error expression cannot be nil here")
 	}
 
-	switch (*expr).(type) {
+	switch e := (*expr).(type) {
 	case *sqlparser.AndExpr:
 		return handleSelectWhereAndExpr(expr, topLevel, parent)
 
@@ -311,6 +313,7 @@ func handleSelectWhere(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Ex
 		}
 
 		colNameStr := sqlparser.String(colName)
+		colNameStr = strings.Replace(colNameStr, "`", "", -1)
 		fromStr := strings.Trim(sqlparser.String(rangeCond.From), `'`)
 		toStr := strings.Trim(sqlparser.String(rangeCond.To), `'`)
 
@@ -333,6 +336,45 @@ func handleSelectWhere(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Ex
 		return handleSelectWhere(&boolExpr, isThisTopLevel, parent)
 	case *sqlparser.NotExpr:
 		return "", errors.New("elasticsql: not expression currently not supported")
+	case *sqlparser.FuncExpr:
+		switch e.Name.Lowered() {
+		case "multi_match":
+			params := e.Exprs
+			if len(params) > 3 || len(params) < 2 {
+				return "", errors.New("elasticsql: the multi_match must have 2 or 3 params, (query, fields and type) or (query, fields)")
+			}
+
+			var typ, query, fields string
+			for i := 0; i < len(params); i++ {
+				elem := strings.Replace(sqlparser.String(params[i]), "`", "", -1) // a = b
+				kv := strings.Split(elem, "=")
+				if len(kv) != 2 {
+					return "", errors.New("elasticsql: the param should be query = xxx, field = yyy, type = zzz")
+				}
+				k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+				switch k {
+				case "type":
+					typ = strings.Replace(v, "'", "", -1)
+				case "query":
+					query = strings.Replace(v, "`", "", -1)
+					query = strings.Replace(query, "'", "", -1)
+				case "fields":
+					fieldList := strings.Split(strings.TrimRight(strings.TrimLeft(v, "("), ")"), ",")
+					for idx, field := range fieldList {
+						fieldList[idx] = fmt.Sprintf(`"%v"`, strings.TrimSpace(field))
+					}
+					fields = strings.Join(fieldList, ",")
+				default:
+					return "", errors.New("elaticsql: unknow param for multi_match")
+				}
+			}
+			if typ == "" {
+				return fmt.Sprintf(`{"multi_match" : {"query" : "%v", "fields" : [%v]}}`, query, fields), nil
+			}
+			return fmt.Sprintf(`{"multi_match" : {"query" : "%v", "type" : "%v", "fields" : [%v]}}`, query, typ, fields), nil
+		default:
+			return "", errors.New("elaticsql: function in where not supported" + e.Name.Lowered())
+		}
 	}
 
 	return "", errors.New("elaticsql: logically cannot reached here")
